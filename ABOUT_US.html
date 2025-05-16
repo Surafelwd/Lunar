@@ -1,146 +1,277 @@
-#ifndef J1850_PWM
-#define J1850_PWM
-
-#include <Arduino.h>
-#include <string.h>
-
-// === PWM Timing Constants for J1850 PWM (41.6 kbps) ===
-#define PWM_HIGH_SHORT   8    // high time for '1' (µs)
-#define PWM_HIGH_LONG   16   // high time for '0' (µs)
-#define PWM_SOF         200   // SOF high duration (µs)
-#define PWM_EOF         280   // EOF low threshold (µs)
-#define PWM_BIT_PERIOD   24   // total bit cell period (µs)
-
-// RX thresholds (µs)
-#define RX_SOF_MIN      (PWM_SOF - 20)
-#define RX_SOF_MAX      (PWM_SOF + 20)
-#define RX_EOF_MIN      PWM_EOF
-#define RX_BIT_TIMEOUT  (PWM_BIT_PERIOD + 20)
-
-// Frame limits
-#define MAX_FRAME_LEN   13    // 12 bytes + CRC
-
-class j1850_pwm {
-private:
-  bool inited = false;
-  uint8_t in_pin, out_pin;
-  byte rx_buf[MAX_FRAME_LEN];
-  byte tx_buf[MAX_FRAME_LEN];
-  int rx_bits;
-
-  byte calcCrc(const byte *data, int len);
-  bool recvFrame();
-  bool sendFrame(const byte *buf, int len);
-
-public:
-  // Initialize pins (bus idle low)
-  void init(uint8_t inPin, uint8_t outPin);
-  // Send `len` bytes (appends CRC)
-  bool send(const byte *data, int len);
-  // Receive a frame into `data`; sets `len` in bytes
-  bool receive(byte *data, int &len, bool checkCrc = true);
-};
-
-#endif // J1850_PWM
-
-
-// M2_J1850-PWM.cpp
 #include "M2_J1850-PWM.h"
 #include <Arduino.h>
-#include <string.h>
+#include <stdarg.h>
 
-void j1850_pwm::init(uint8_t inPin, uint8_t outPin) {
-  in_pin = inPin;
-  out_pin = outPin;
-  pinMode(in_pin, INPUT);
-  pinMode(out_pin, OUTPUT);
-  digitalWrite(out_pin, LOW); // idle low
-  inited = true;
-}
+void j1850_pwm::init(int in_pin_, int out_pin_, bool review_) {
+    in_pin = in_pin_;
+    out_pin = out_pin_;
+    review = review_;
+    if_init = true;
+    mode = 1;
+    message = 0;
 
-bool j1850_pwm::send(const byte *data, int len) {
-  if (!inited || len < 1 || len > (MAX_FRAME_LEN - 1)) return false;
-  memcpy(tx_buf, data, len);
-  tx_buf[len] = calcCrc(data, len);
-  return sendFrame(tx_buf, len + 1);
-}
+    pinMode(in_pin, INPUT);
+    pinMode(out_pin, OUTPUT);
+    passive();
 
-bool j1850_pwm::receive(byte *data, int &len, bool checkCrc) {
-  if (!inited) return false;
-  if (!recvFrame()) return false;
-
-  int byteCount = (rx_bits + 7) / 8;
-  if (byteCount < 1 || byteCount > MAX_FRAME_LEN) return false;
-
-  if (checkCrc && byteCount > 1) {
-    byte crc = calcCrc(rx_buf, byteCount - 1);
-    if (crc != rx_buf[byteCount - 1]) return false;
-  }
-
-  memcpy(data, rx_buf, byteCount);
-  len = byteCount;
-  return true;
-}
-
-bool j1850_pwm::sendFrame(const byte *buf, int len) {
-  // 1. SOF high
-  digitalWrite(out_pin, HIGH);
-  delayMicroseconds(PWM_SOF);
-  digitalWrite(out_pin, LOW);
-  // align to next bit boundary
-  unsigned int rem = PWM_SOF % PWM_BIT_PERIOD;
-  if (rem) delayMicroseconds(PWM_BIT_PERIOD - rem);
-
-  // 2. Data bits MSB-first
-  for (int i = 0; i < len; ++i) {
-    for (int bit = 7; bit >= 0; --bit) {
-      bool isOne = (buf[i] & (1 << bit));
-      unsigned int highTime = isOne ? PWM_HIGH_SHORT : PWM_HIGH_LONG;
-      digitalWrite(out_pin, HIGH);
-      delayMicroseconds(highTime);
-      digitalWrite(out_pin, LOW);
-      delayMicroseconds(PWM_BIT_PERIOD - highTime);
+    if (review) {
+        Serial.begin(115200);
     }
-  }
-
-  // 3. EOF low
-  digitalWrite(out_pin, LOW);
-  delayMicroseconds(PWM_EOF);
-  return true;
 }
 
-bool j1850_pwm::recvFrame() {
-  memset(rx_buf, 0, sizeof(rx_buf));
-  rx_bits = 0;
+bool j1850_pwm::accept(byte *msg_buf, int &nbytes, bool check_crc) {
+    if (!if_init) {
+        message = ERROR_NO_RESPONSE_WITHIN_TIMEOUT;
+        return false;
+    }
 
-  // 1. Detect SOF
-  unsigned long sofdur = pulseIn(in_pin, HIGH, RX_SOF_MAX + 50);
-  if (sofdur < RX_SOF_MIN || sofdur > RX_SOF_MAX) return false;
-
-  // 2. Read bits until EOF
-  while (rx_bits < MAX_FRAME_LEN * 8) {
-    unsigned long lowDur = pulseIn(in_pin, LOW, RX_EOF_MIN + 100);
-    if (lowDur >= RX_EOF_MIN) break; // EOF
-
-    unsigned long highDur = pulseIn(in_pin, HIGH, RX_BIT_TIMEOUT);
-    if (highDur == 0 || highDur < (PWM_HIGH_SHORT - 4) || highDur > (PWM_HIGH_LONG + 4)) return false;
-
-    bool bitVal = (highDur <= PWM_HIGH_SHORT + 2);
-    int bytePos = rx_bits >> 3;
-    int bitPos  = 7 - (rx_bits & 0x07);
-    if (bytePos >= MAX_FRAME_LEN) return false;
-    if (bitVal) rx_buf[bytePos] |= (1 << bitPos);
-    rx_bits++;
-  }
-  return rx_bits > 0;
+    bool ok = recv_msg(msg_buf, nbytes);
+    if (ok && check_crc && nbytes > 1) {
+        byte calc_crc = crc(msg_buf, nbytes - 1);
+        if (msg_buf[nbytes - 1] != calc_crc) {
+            ok = false;
+            message = ERROR_ACCEPT_CRC;
+            if (review) {
+                Serial.print("CRC Error: Expected 0x");
+                Serial.print(calc_crc, HEX);
+                Serial.print(", Got 0x");
+                Serial.println(msg_buf[nbytes - 1], HEX);
+            }
+        }
+    }
+    if (ok && review) {
+        sendToUART("RX: ", nbytes, msg_buf);
+    }
+    if (!ok && review) {
+        monitor();
+    }
+    return ok;
 }
 
-byte j1850_pwm::calcCrc(const byte *data, int len) {
-  byte crc = 0xFF;
-  for (int i = 0; i < len; ++i) {
-    crc ^= data[i];
-    for (int b = 0; b < 8; ++b)
-      crc = (crc & 0x80) ? (crc << 1) ^ 0x1D : crc << 1;
-  }
-  return crc ^ 0xFF;
+bool j1850_pwm::easy_send(int size, ...) {
+    if (size <= 0 || size > MAX_FRAME_LEN - 1) {
+        message = ERROR_MESSAGE_TOO_LONG;
+        return false;
+    }
+    byte buf[MAX_FRAME_LEN];
+    va_list ap;
+    va_start(ap, size);
+    for (int i = 0; i < size; ++i) {
+        buf[i] = va_arg(ap, int);
+    }
+    va_end(ap);
+    return send(buf, size);
+}
+
+bool j1850_pwm::send(byte *msg_buf, int nbytes) {
+    if (!if_init) {
+        message = ERROR_NO_RESPONSE_WITHIN_TIMEOUT;
+        return false;
+    }
+    if (nbytes > MAX_FRAME_LEN - 1) {
+        message = ERROR_MESSAGE_TOO_LONG;
+        return false;
+    }
+    memcpy(tx_msg_buf, msg_buf, nbytes);
+    tx_msg_buf[nbytes] = crc(tx_msg_buf, nbytes);
+    nbytes++;
+    bool ok = send_msg(tx_msg_buf, nbytes);
+    if (ok && review) {
+        sendToUART("TX: ", nbytes, tx_msg_buf);
+    }
+    if (!ok && review) {
+        monitor();
+    }
+    return ok;
+}
+
+bool j1850_pwm::send_msg(byte *msg_buf, int nbytes) {
+    // Wait IFS
+    start_timer();
+    while (read_timer() < PWM_IFS_TIME) {
+        if (is_active()) {
+            start_timer();
+        }
+    }
+
+    // Send SOF
+    active();
+    delayMicroseconds(PWM_SOF_TIME);
+    passive();
+
+    // Send each byte, MSB first, with collision detection
+    for (int b = 0; b < nbytes; ++b) {
+        byte val = msg_buf[b];
+        for (int bit = 7; bit >= 0; --bit) {
+            bool bit1 = (val >> bit) & 1;
+            if (bit1) {
+                // '1': dominant then recessive
+                active();
+                delayMicroseconds(PWM_HALF_BIT_TIME);
+                if (!is_active()) {
+                    passive();
+                    message = ERROR_BUS_COLLISION;
+                    if (review) Serial.println("Collision: Dominant bit overridden");
+                    return false;
+                }
+                passive();
+                delayMicroseconds(PWM_HALF_BIT_TIME);
+            } else {
+                // '0': recessive then dominant
+                passive();
+                delayMicroseconds(PWM_HALF_BIT_TIME);
+                active();
+                delayMicroseconds(PWM_HALF_BIT_TIME);
+                if (!is_active()) {
+                    message = ERROR_BUS_COLLISION;
+                    if (review) Serial.println("Collision: Dominant bit detected");
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Send EOF
+    passive();
+    delayMicroseconds(PWM_EOF_TIME);
+
+    message = MESSAGE_SEND_OK;
+    return true;
+}
+
+bool j1850_pwm::recv_msg(byte *msg_buf, int &nbytes) {
+    int byte_count = 0;
+    unsigned long t;
+
+    // Wait for SOF: detect dominant for ~200 µs
+    start_timer();
+    while (!is_active()) {
+        if (read_timer() > PWM_IFS_TIME * 2) {
+            message = ERROR_NO_RESPONSE_WITHIN_TIMEOUT;
+            if (review) Serial.println("RX: Timeout waiting for SOF");
+            return false;
+        }
+    }
+    start_timer();
+    while (is_active()) {
+        t = read_timer();
+        if (t > PWM_SOF_TIME + PWM_HALF_BIT_TIME) {
+            message = ERROR_SYMBOL_TIMEOUT;
+            if (review) Serial.print("RX: SOF too long: "); Serial.println(t);
+            return false;
+        }
+    }
+    if (t < RX_SOF_MIN) {
+        message = ERROR_SYMBOL_TIMEOUT;
+        if (review) Serial.print("RX: SOF too short: "); Serial.println(t);
+        return false;
+    }
+
+    // Receive bytes until EOF
+    while (byte_count < MAX_FRAME_LEN) {
+        byte val = 0;
+        for (int bit = 7; bit >= 0; --bit) {
+            delayMicroseconds(PWM_HALF_BIT_TIME / 2); // Align to midpoint
+            bool level = is_active();
+            delayMicroseconds(PWM_HALF_BIT_TIME); // Wait for next half-bit
+            bool next_level = is_active();
+            val |= (level ? 1 : 0) << bit;
+            delayMicroseconds(PWM_HALF_BIT_TIME / 2);
+        }
+        msg_buf[byte_count++] = val;
+
+        // Check for EOF: recessive for ~200 µs
+        if (!is_active()) {
+            start_timer();
+            while (!is_active()) {
+                t = read_timer();
+                if (t >= RX_EOF_MIN) {
+                    nbytes = byte_count;
+                    rx_nbyte = byte_count;
+                    message = MESSAGE_ACCEPT_OK;
+                    if (review) Serial.print("RX: EOF detected after "); Serial.println(t);
+                    return true;
+                }
+            }
+        }
+    }
+
+    message = ERROR_MESSAGE_TOO_LONG;
+    if (review) Serial.println("RX: Frame too long");
+    return false;
+}
+
+byte j1850_pwm::crc(byte *msg_buf, int nbytes) {
+    byte c = 0xFF;
+    while (nbytes--) {
+        c ^= *msg_buf++;
+        for (int i = 0; i < 8; ++i) {
+            c = (c & 0x80) ? (c << 1) ^ 0x1D : (c << 1);
+        }
+    }
+    return c ^ 0xFF;
+}
+
+void j1850_pwm::start_timer() { time_tmp = micros(); }
+unsigned long j1850_pwm::read_timer() { return micros() - time_tmp; }
+void j1850_pwm::active() { digitalWrite(out_pin, HIGH); }
+void j1850_pwm::passive() { digitalWrite(out_pin, LOW); }
+bool j1850_pwm::is_active() { return digitalRead(in_pin); }
+
+void j1850_pwm::sendToUART(const char *header, int n, byte *buf) {
+    Serial.print(header);
+    for (int i = 0; i < n; ++i) {
+        if (buf[i] < 0x10) Serial.print('0');
+        Serial.print(buf[i], HEX);
+        if (i < n - 1) Serial.print(' ');
+    }
+    Serial.println();
+}
+
+void j1850_pwm::monitor() {
+    switch (message) {
+        case MESSAGE_SEND_OK:
+            Serial.println("Status: Send OK");
+            break;
+        case MESSAGE_ACCEPT_OK:
+            Serial.println("Status: Accept OK");
+            break;
+        case ERROR_MESSAGE_TOO_LONG:
+            Serial.println("Error: Message too long");
+            break;
+        case ERROR_NO_RESPONSE_WITHIN_TIMEOUT:
+            Serial.println("Error: No response within timeout");
+            break;
+        case ERROR_SYMBOL_TIMEOUT:
+            Serial.println("Error: Symbol timeout");
+            break;
+        case ERROR_ACCEPT_CRC:
+            Serial.println("Error: CRC mismatch");
+            break;
+        case ERROR_BUS_COLLISION:
+            Serial.println("Error: Bus collision");
+            break;
+        default:
+            Serial.print("Unknown status: ");
+            Serial.println(message);
+            break;
+    }
+}
+
+void j1850_pwm::tests() {
+    Serial.println("----Start I/O test----");
+    passive();
+    if (!is_active()) {
+        active();
+        delayMicroseconds(10);
+        if (is_active()) {
+            Serial.println("I/O OK");
+        } else {
+            Serial.println("I/O Fail: Active state not detected");
+        }
+        passive();
+    } else {
+        Serial.println("I/O Fail: Line already active");
+    }
+    Serial.println("----End I/O test----");
 }
