@@ -1,40 +1,146 @@
-<!DOCTYPE html>
-<html lang="en" dir="ltr">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width intial-scale=">
-    <title>ABOUT</title>
-    <div>
-     <header>
-        <center><br> <table border="0" WIDTH="100%">
-         <tr>
-           <td><a href="HOME.html">HOME</a></td>
-        </tr>
-        <tr>
-          <td><a href="GALLERY.html">GALLERY</a></td>
-        </tr>
-        <tr>
-          <td><a href="CONTACT.html">CONTACT US</a></td>
-        </tr>
-       </table> </center>
-     </header>
-   </div>
-  </head>
-  <body  background= "6.jpg">
-    <center>
-      <p>ABOUT US <br>
-        dictum at tempor commodo ullamcorper a lacus vestibulum. Nunc vel risus
-         commodo viverra<br> maecenas. Eleifend mi in nulla posuere sollicitudin
-         aliquam ultrices sagittis. Mi in nulla posuere <br> sollicitudin aliquam
-         ultrices sagittis orci a. Viverra maecenas accumsan l
-      </p>
-      <p><br><br> TEAM
-        <table>
-          <tr>
-            <td></td>
-          </tr>
-        </table>
-      </p>
-    </center>
-  </body>
-</html>
+#ifndef J1850_PWM
+#define J1850_PWM
+
+#include <Arduino.h>
+#include <string.h>
+
+// === PWM Timing Constants for J1850 PWM (41.6 kbps) ===
+#define PWM_HIGH_SHORT   8    // high time for '1' (µs)
+#define PWM_HIGH_LONG   16   // high time for '0' (µs)
+#define PWM_SOF         200   // SOF high duration (µs)
+#define PWM_EOF         280   // EOF low threshold (µs)
+#define PWM_BIT_PERIOD   24   // total bit cell period (µs)
+
+// RX thresholds (µs)
+#define RX_SOF_MIN      (PWM_SOF - 20)
+#define RX_SOF_MAX      (PWM_SOF + 20)
+#define RX_EOF_MIN      PWM_EOF
+#define RX_BIT_TIMEOUT  (PWM_BIT_PERIOD + 20)
+
+// Frame limits
+#define MAX_FRAME_LEN   13    // 12 bytes + CRC
+
+class j1850_pwm {
+private:
+  bool inited = false;
+  uint8_t in_pin, out_pin;
+  byte rx_buf[MAX_FRAME_LEN];
+  byte tx_buf[MAX_FRAME_LEN];
+  int rx_bits;
+
+  byte calcCrc(const byte *data, int len);
+  bool recvFrame();
+  bool sendFrame(const byte *buf, int len);
+
+public:
+  // Initialize pins (bus idle low)
+  void init(uint8_t inPin, uint8_t outPin);
+  // Send `len` bytes (appends CRC)
+  bool send(const byte *data, int len);
+  // Receive a frame into `data`; sets `len` in bytes
+  bool receive(byte *data, int &len, bool checkCrc = true);
+};
+
+#endif // J1850_PWM
+
+
+// M2_J1850-PWM.cpp
+#include "M2_J1850-PWM.h"
+#include <Arduino.h>
+#include <string.h>
+
+void j1850_pwm::init(uint8_t inPin, uint8_t outPin) {
+  in_pin = inPin;
+  out_pin = outPin;
+  pinMode(in_pin, INPUT);
+  pinMode(out_pin, OUTPUT);
+  digitalWrite(out_pin, LOW); // idle low
+  inited = true;
+}
+
+bool j1850_pwm::send(const byte *data, int len) {
+  if (!inited || len < 1 || len > (MAX_FRAME_LEN - 1)) return false;
+  memcpy(tx_buf, data, len);
+  tx_buf[len] = calcCrc(data, len);
+  return sendFrame(tx_buf, len + 1);
+}
+
+bool j1850_pwm::receive(byte *data, int &len, bool checkCrc) {
+  if (!inited) return false;
+  if (!recvFrame()) return false;
+
+  int byteCount = (rx_bits + 7) / 8;
+  if (byteCount < 1 || byteCount > MAX_FRAME_LEN) return false;
+
+  if (checkCrc && byteCount > 1) {
+    byte crc = calcCrc(rx_buf, byteCount - 1);
+    if (crc != rx_buf[byteCount - 1]) return false;
+  }
+
+  memcpy(data, rx_buf, byteCount);
+  len = byteCount;
+  return true;
+}
+
+bool j1850_pwm::sendFrame(const byte *buf, int len) {
+  // 1. SOF high
+  digitalWrite(out_pin, HIGH);
+  delayMicroseconds(PWM_SOF);
+  digitalWrite(out_pin, LOW);
+  // align to next bit boundary
+  unsigned int rem = PWM_SOF % PWM_BIT_PERIOD;
+  if (rem) delayMicroseconds(PWM_BIT_PERIOD - rem);
+
+  // 2. Data bits MSB-first
+  for (int i = 0; i < len; ++i) {
+    for (int bit = 7; bit >= 0; --bit) {
+      bool isOne = (buf[i] & (1 << bit));
+      unsigned int highTime = isOne ? PWM_HIGH_SHORT : PWM_HIGH_LONG;
+      digitalWrite(out_pin, HIGH);
+      delayMicroseconds(highTime);
+      digitalWrite(out_pin, LOW);
+      delayMicroseconds(PWM_BIT_PERIOD - highTime);
+    }
+  }
+
+  // 3. EOF low
+  digitalWrite(out_pin, LOW);
+  delayMicroseconds(PWM_EOF);
+  return true;
+}
+
+bool j1850_pwm::recvFrame() {
+  memset(rx_buf, 0, sizeof(rx_buf));
+  rx_bits = 0;
+
+  // 1. Detect SOF
+  unsigned long sofdur = pulseIn(in_pin, HIGH, RX_SOF_MAX + 50);
+  if (sofdur < RX_SOF_MIN || sofdur > RX_SOF_MAX) return false;
+
+  // 2. Read bits until EOF
+  while (rx_bits < MAX_FRAME_LEN * 8) {
+    unsigned long lowDur = pulseIn(in_pin, LOW, RX_EOF_MIN + 100);
+    if (lowDur >= RX_EOF_MIN) break; // EOF
+
+    unsigned long highDur = pulseIn(in_pin, HIGH, RX_BIT_TIMEOUT);
+    if (highDur == 0 || highDur < (PWM_HIGH_SHORT - 4) || highDur > (PWM_HIGH_LONG + 4)) return false;
+
+    bool bitVal = (highDur <= PWM_HIGH_SHORT + 2);
+    int bytePos = rx_bits >> 3;
+    int bitPos  = 7 - (rx_bits & 0x07);
+    if (bytePos >= MAX_FRAME_LEN) return false;
+    if (bitVal) rx_buf[bytePos] |= (1 << bitPos);
+    rx_bits++;
+  }
+  return rx_bits > 0;
+}
+
+byte j1850_pwm::calcCrc(const byte *data, int len) {
+  byte crc = 0xFF;
+  for (int i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; ++b)
+      crc = (crc & 0x80) ? (crc << 1) ^ 0x1D : crc << 1;
+  }
+  return crc ^ 0xFF;
+}
